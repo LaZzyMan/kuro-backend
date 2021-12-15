@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Test Train API</title>
+    <script
+      type="text/javascript"
+      src="//cdn.bootcss.com/jquery/3.1.1/jquery.min.js"
+    ></script>
+    <script
+      type="text/javascript"
+      src="//cdn.bootcss.com/socket.io/3.0.1/socket.io.min.js"
+    ></script>
+  </head>
+  <body>
+    <h2>Test Train API</h2>
+    <button id="trainBtn">Train Model</button>
+    <div id="t"></div>
+    <script>
+      $(document).ready(function () {
+        const nameSpace = "/kuro";
+        const socket = io.connect(
+          "ws://" + document.domain + ":" + location.port + nameSpace
+        );
+        socket.on("response_connect", (res) => {
+          const t = res.msg;
+          if (t) {
+            $("#t").append(t).append("<br/>");
+          }
+          $("#trainBtn").on("click", () => {
+            socket.emit("train", [1, 2, 3]);
+          });
+        });
+        socket.on("response_disconnect", (res) => {
+          const t = res.msg;
+          if (t) {
+            $("#t").append(t).append("<br/>");
+          }
+        });
+        socket.on("train_info", (res) => {
+          if (res.type === "epoch") {
+            $("#t")
+              .append("Epoch " + res.content.count + ".")
+              .append("<br/>");
+          } else if (res.type === "info") {
+            $("#t").append(res.content).append("<br/>");
+          }
+        });
+        socket.on("train_result", (res) => {
+          if (res.type === "info") {
+            $("#t").append(res.content).append("<br/>");
+          } else if (res.type === "result") {
+            console.log(res.content);
+          }
+        });
+      });
+    </script>
+  </body>
+</html>
