@@ -1,4 +1,5 @@
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras import layers, losses, Model
 from tensorflow.keras import backend as K
 from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler, Callback, LambdaCallback
@@ -7,10 +8,12 @@ from tensorflow.keras.layers import Activation
 from tensorflow_addons.optimizers import AdamW
 from layers import GatherIndices, GraphConvolution, AggregationLayer, SqueezedSparseConversion
 from sklearn.metrics import classification_report, confusion_matrix, cohen_kappa_score
-from sklearn.model_selection import ParameterGrid
+import os
+import json
 
 class KuroModel:
-    def __init__(self, embedding_size, layer_sizes, dropout, lr, wd) -> None:
+    def __init__(self, id, embedding_size, layer_sizes, dropout, lr, wd) -> None:
+        self.id = id
         self.classes = ['C', 'G', 'M', 'P', 'R', 'U']
         self.embedding_size = embedding_size
         self.layer_sizes = layer_sizes
@@ -18,6 +21,41 @@ class KuroModel:
         self.lr = lr
         self.wd = wd
         self.model = None
+        self.result = None
+        self.train_set = None
+        self.int_grad = None
+
+
+    def save(self):
+        dir = f'./models/{self.id}'
+        os.mkdir(dir)
+        self.model.save(f'{dir}/model')
+        with open(f'{dir}/params.json', 'w+') as f:
+            json.dump({
+                'embeddingSize': self.embedding_size,
+                'layerSizes': self.layer_sizes,
+                'dropout': self.dropout,
+                'lr': self.lr,
+                'wd': self.wd,
+                'trainSet': self.train_set,
+                'result': self.result
+                }, f)
+            f.close()
+
+    def load(self):
+        dir = f'./models/{self.id}'
+        if os.path.exists(dir):
+            with open(f'{dir}/params.json', 'w+') as f:
+                params = json.load(f)
+                f.close()
+            self.embedding_size = params['embeddingSize']
+            self.layer_sizes = params['layerSizes']
+            self.dropout = params['dropout']
+            self.lr = params['lr']
+            self.wd = params['wd']
+            self.result = params['result']
+            self.train_set = params['trainSet']
+            self.model = tf.keras.models.load_model(f'{dir}/model')
 
     def encode(self, codes):
         out = []
@@ -126,7 +164,10 @@ class KuroModel:
             ],
         )
 
+        self.int_grad = IntegratedGradients(self.model, train_seq)
+
     def prediction(self, train_set):
+        self.train_set = train_set
         test_set = np.setdiff1d(self.all_out_indices, train_set)
         test_seq = self.input_seq_generator.seq(test_set, self.all_output[:, test_set])
 
@@ -150,7 +191,10 @@ class KuroModel:
         test_single_result = classification_report(test_true, test_preds, target_names=self.classes, output_dict=True)
         test_kappa = cohen_kappa_score([i.argmax() for i in self.all_output.squeeze()[test_set]], [i.argmax() for i in self.encode(test_preds)])
 
-        return {'all_result': overall_single_result, 'test_result': test_single_result, 'all_kappa': overall_kappa, 'test_kappa': test_kappa}
+        self.result = {'id': self.id, 'pred': list(all_preds), 'all_result': overall_single_result, 'test_result': test_single_result, 'all_kappa': overall_kappa, 'test_kappa': test_kappa}
+
+    def get_ig(self, rid):
+        return [[np.float(j) for j in self.int_grad.get_self_feature_igs(rid, i, steps=50, features_baseline='mean')] for i in range(6)]
 
 class WeightDecayScheduler(Callback):
     def __init__(self, schedule, verbose=0):
@@ -208,3 +252,89 @@ class InputSequenceGenerator:
         if targets is not None:
             self.targets = targets
         return InputSequence(self.inputs, self.targets)
+
+
+class IntegratedGradients:
+  def __init__(self, model, seq):
+    self._adj_value = seq.A_values
+    self._adj_inds = seq.A_indices
+    self._features = seq.features
+    self._model = model
+    self._num_node = seq.n_nodes
+    self._node_idx = None
+
+  def get_integrated_gradients(self, node_idx, class_of_interest, features_baseline=None, steps=20):
+    if features_baseline is None:
+      features_baseline = np.zeros(self._features.shape)
+    if features_baseline == 'mean':
+      features_baseline = K.expand_dims(self._features.mean(1).repeat(self._num_node, axis=0), 0)
+    features_diff = self._features - features_baseline
+    total_gradients = np.zeros(self._features.shape)
+    for alpha in np.linspace(0, 1, steps):
+      features_step = features_baseline + alpha * features_diff
+      model_input = [tf.convert_to_tensor(features_step), tf.convert_to_tensor(np.array([[node_idx]])), tf.convert_to_tensor(self._adj_inds), tf.convert_to_tensor(self._adj_value)]
+      grads = self._compute_gradients(model_input, class_of_interest, wrt=model_input[0])
+      total_gradients += grads
+    return np.squeeze(total_gradients * features_diff / steps, 0)
+
+  def get_feature_igs(self, node_idx, class_of_interest, features_baseline=None, steps=20):
+    cat_features = np.concatenate(self._features, axis=-1)
+    if features_baseline is None:
+      features_baseline = np.zeros(cat_features.shape)
+    if features_baseline == 'mean':
+      features_baseline = K.expand_dims(cat_features.mean(1).repeat(self._num_node, axis=0), 0)
+    features_diff = cat_features - features_baseline
+    total_gradients = np.zeros(cat_features.shape)
+    for alpha in np.linspace(0, 1, steps):
+      features_step = features_baseline + alpha * features_diff
+      features_input = [features_step[:,:,:19], features_step[:,:,19:36], features_step[:,:,36:40], features_step[:,:,40:1554], features_step[:,:,1554:]]
+      model_input = [[tf.convert_to_tensor(f) for f in features_input], tf.convert_to_tensor(np.array([[node_idx]])), tf.convert_to_tensor(self._adj_inds), tf.convert_to_tensor(self._adj_value)]
+      grads = self._compute_gradients(model_input, class_of_interest, wrt=model_input[0])
+      total_gradients += tf.concat(grads, -1)
+    return np.squeeze(total_gradients * features_diff / steps, 0)
+
+  def get_self_feature_igs(self, node_idx, class_of_interest, features_baseline=None, steps=20):
+    self._node_idx = node_idx
+    cat_features = np.concatenate(self._features, axis=-1)
+    num_features = cat_features.shape[2]
+    if features_baseline is None:
+      features_baseline = np.zeros(num_features)
+    if features_baseline == 'mean':
+      features_baseline = cat_features.mean(1)[0]
+    features_diff = cat_features[0][node_idx] - features_baseline
+    total_gradients = np.zeros(num_features)
+    for alpha in np.linspace(0, 1, steps):
+      features_step = features_baseline + alpha * features_diff
+      features_input = [features_step[:19], features_step[19:36], features_step[36:40], features_step[40:1554], features_step[1554:]]
+      wrt = [tf.convert_to_tensor(f, dtype='float32') for f in features_input]
+      model_input = [[tf.convert_to_tensor(f) for f in self._features], tf.convert_to_tensor(np.array([[node_idx]])), tf.convert_to_tensor(self._adj_inds), tf.convert_to_tensor(self._adj_value)]
+      grads = self._compute_self_gradients(model_input, class_of_interest, wrt=wrt)
+      total_gradients += tf.concat(grads, -1)
+    return np.array(total_gradients * features_diff / steps)
+
+  def _compute_self_gradients(self, model_input, class_of_interest, wrt):
+    sup_1 = [np.zeros((1, self._num_node, i.shape[0])) for i in wrt]
+    sup_2 = [np.ones((1, self._num_node, i.shape[0])) for i in wrt]
+    for i in range(len(self._features)):
+      sup_1[i][0][self._node_idx] = np.ones(wrt[i].shape)
+      sup_2[i][0][self._node_idx] = np.zeros(wrt[i].shape)
+    sup_1 = [tf.convert_to_tensor(f, dtype='float32') for f in sup_1]
+    sup_2 = [tf.convert_to_tensor(f, dtype='float32') for f in sup_2]
+    class_of_interest = tf.convert_to_tensor(class_of_interest)
+    with tf.GradientTape() as tape:
+      tape.watch(wrt)
+      for i in range(len(self._features)):
+        model_input[0][i] = tf.multiply(sup_1[i], K.expand_dims(tf.tile(input=K.expand_dims(wrt[i], 0), multiples=[self._num_node, 1]), 0)) + tf.multiply(model_input[0][i], sup_2[i])
+      output = self._model(model_input)
+      cost_value = K.gather(output[0, 0], class_of_interest)
+    gradients = tape.gradient(cost_value, wrt)
+    return gradients
+  
+  def _compute_gradients(self, model_input, class_of_interest, wrt):
+    class_of_interest = tf.convert_to_tensor(class_of_interest)
+    with tf.GradientTape() as tape:
+      tape.watch(wrt)
+      output = self._model(model_input)
+      cost_value = K.gather(output[0, 0], class_of_interest)
+    gradients = tape.gradient(cost_value, wrt)
+    return gradients
