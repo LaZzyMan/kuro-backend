@@ -1,18 +1,29 @@
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, losses, Model
+from tensorflow.keras import layers, Model
 from tensorflow.keras import backend as K
 from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler, Callback, LambdaCallback
 from tensorflow.keras.utils import Sequence
-from tensorflow.keras.layers import Activation
+from tensorflow.keras.layers import Activation, Concatenate
 from tensorflow_addons.optimizers import AdamW
-from layers import GatherIndices, GraphConvolution, AggregationLayer, SqueezedSparseConversion
+from layers import GraphConvolution, AggregationLayer, SqueezedSparseConversion, Loss
 from sklearn.metrics import classification_report, confusion_matrix, cohen_kappa_score
 import os
 import json
+import zipfile
+import shutil
+
+def zip(folder, file):
+  z = zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) 
+  for dirpath, dirnames, filenames in os.walk(folder):
+    fpath = dirpath.replace(folder,'') 
+    fpath = fpath and fpath + os.sep or ''
+    for filename in filenames:
+        z.write(os.path.join(dirpath, filename),fpath+filename)
+  z.close()
 
 class KuroModel:
-    def __init__(self, id, embedding_size, layer_sizes, dropout, lr, wd) -> None:
+    def __init__(self, id, embedding_size, layer_sizes, dropout, lr, wd, e, weights) -> None:
         self.id = id
         self.classes = ['C', 'G', 'M', 'P', 'R', 'U']
         self.embedding_size = embedding_size
@@ -20,13 +31,31 @@ class KuroModel:
         self.dropout = dropout
         self.lr = lr
         self.wd = wd
+        self.e = e
+        self.weights = weights
         self.model = None
         self.result = None
         self.train_set = None
         self.int_grad = None
 
+    def info(self):
+      return {
+        'params': {
+          'embeddingSize': self.embedding_size,
+          'gcnSize1': self.layer_sizes[0],
+          'gcnSize2': self.layer_sizes[1],
+          'dropout': self.dropout,
+          'lr': self.lr,
+          'wd': self.wd,
+        },
+        'id': self.id,
+        'trainSet': list([np.int(i) for i in self.train_set]),
+        'result': self.result
+      }
 
     def save(self):
+        if(os.path.exists(f'./models/{self.id}.zip')):
+          return self.id
         dir = f'./models/{self.id}'
         os.mkdir(dir)
         self.model.save(f'{dir}/model')
@@ -37,10 +66,14 @@ class KuroModel:
                 'dropout': self.dropout,
                 'lr': self.lr,
                 'wd': self.wd,
-                'trainSet': self.train_set,
-                'result': self.result
+                'trainSet': list([np.int(i) for i in self.train_set]),
+                'result': self.result,
+                'id': self.id
                 }, f)
             f.close()
+        zip(dir, f'./models/{self.id}.zip')
+        shutil.rmtree(dir,ignore_errors=True)
+        return self.id
 
     def load(self):
         dir = f'./models/{self.id}'
@@ -76,7 +109,9 @@ class KuroModel:
         out_indices = layers.Input(batch_shape=(1, None), dtype='int32', name='out_indices')
         adj_indices = layers.Input(batch_shape=(1, None, 2), dtype='int64', name='Adj_indices')
         adj_values = layers.Input(batch_shape=(1, None), name='Adj_values')
-        x_input = [feature_inputs, out_indices, adj_indices, adj_values]
+        target = layers.Input(batch_shape=(1, None, 6), name='target')
+        weight = layers.Input(batch_shape=(1, 1602, 6), name='weight')
+        x_input = [feature_inputs, out_indices, adj_indices, adj_values, target, weight]
         adj_inputs = SqueezedSparseConversion(shape=(1514, 1514), dtype=adj_values.dtype)([adj_indices, adj_values])
         x_outs = [layers.Dense(units=self.embedding_size, activation='relu', name=f'Hidden_%s' % features[i])(f) for i, f in enumerate(feature_inputs)]
         # x_outs = feature_inputs
@@ -88,14 +123,17 @@ class KuroModel:
         x_out = GraphConvolution(self.layer_sizes[1], activation='relu', name='GC_2')([x_out, adj_inputs])
 
         # softmax多分类预测
-        x_out = GatherIndices(batch_dims=1)([x_out, out_indices])
-        predictions = Activation('softmax')(layers.Dense(units=6, name='pred_score')(x_out))
-        self.model = Model(inputs=x_input, outputs=predictions)
+        x_out = Activation('softmax')(layers.Dense(units=6, name='pred_score')(x_out)) 
+        feature_concat = Concatenate()(feature_inputs)
+        x_out = Loss(e=self.e)([x_out, target, out_indices, weight, feature_concat])
+        self.model = Model(inputs=x_input, outputs=x_out)
 
+        def loss_function(y_true, y_pred):
+            return y_pred[0]
+        
         self.model.compile(
             optimizer=AdamW(weight_decay=self.wd, learning_rate=self.lr),
-            loss=losses.categorical_crossentropy,
-            metrics=["acc"],
+            loss=loss_function,
         )
 
     def load_data(self):
@@ -107,12 +145,13 @@ class KuroModel:
         feature_mobility = np.load('./data/featureMobility.npy')
         feature_rhythm = np.load('./data/featureRhythm.npy')
 
-        self.all_out_indices = np.load('./data/allOutIndices.npy')[0]
+        # self.all_out_indices = np.load('./data/allOutIndices.npy')[0]
+        self.all_out_indices = np.array([i for i in range(1514)])
         self.all_output = np.load('./data/allOutput.npy')
 
         self.default_train_set = np.load('./data/trainSet.npy')[0]
 
-        self.input_seq_generator = InputSequenceGenerator(adj_indices, adj_values, [feature_lc, feature_poi, feature_building, feature_mobility, feature_rhythm])
+        self.input_seq_generator = InputSequenceGenerator(adj_indices, adj_values, [feature_lc, feature_poi, feature_building, feature_mobility, feature_rhythm], self.weights)
 
     def train(self, train_set, callback):
         # 生成训练集输入Sequence
@@ -148,7 +187,7 @@ class KuroModel:
 
         reduce_lr = LearningRateScheduler(lr_scheduler)
         reduce_wd = WeightDecayScheduler(wd_schedule)
-        es_callback = EarlyStopping(monitor="val_acc", patience=200, restore_best_weights=True)
+        es_callback = EarlyStopping(monitor="val_loss", patience=200, restore_best_weights=True)
 
         self.model.fit(
             train_seq,
@@ -172,10 +211,10 @@ class KuroModel:
         test_seq = self.input_seq_generator.seq(test_set, self.all_output[:, test_set])
 
         # 计算整个分类的结果
-        all_seq = self.input_seq_generator.seq(self.all_out_indices)
+        all_seq = self.input_seq_generator.seq(self.all_out_indices, self.all_output[:, self.all_out_indices])
 
-        all_scores = self.model.predict(all_seq).squeeze()
-        test_scores = self.model.predict(test_seq).squeeze()
+        all_scores = self.model.predict(all_seq)[1].squeeze()
+        test_scores = self.model.predict(test_seq)[1].squeeze()
 
         all_preds = self.decode(all_scores)
         all_true = self.decode(self.all_output.squeeze()[self.all_out_indices])
@@ -191,7 +230,7 @@ class KuroModel:
         test_single_result = classification_report(test_true, test_preds, target_names=self.classes, output_dict=True)
         test_kappa = cohen_kappa_score([i.argmax() for i in self.all_output.squeeze()[test_set]], [i.argmax() for i in self.encode(test_preds)])
 
-        self.result = {'id': self.id, 'pred': list(all_preds), 'all_result': overall_single_result, 'test_result': test_single_result, 'all_kappa': overall_kappa, 'test_kappa': test_kappa}
+        self.result = {'id': self.id, 'score': list([list([np.float(j) for j in i]) for i in all_scores]), 'pred': list(all_preds), 'all_result': overall_single_result, 'test_result': test_single_result, 'all_kappa': overall_kappa, 'test_kappa': test_kappa}
 
     def get_ig(self, rid):
         return [[np.float(j) for j in self.int_grad.get_self_feature_igs(rid, i, steps=50, features_baseline='mean')] for i in range(6)]
@@ -227,6 +266,7 @@ class InputSequence(Sequence):
         self.A_indices = inputs[2]
         self.A_values = inputs[3]
         self.features = inputs[0]
+        self.weight_matrix = inputs[5]
         self.n_features = sum([i.shape[-1] for i in self.features])
         self.n_nodes = self.features[0].shape[1]
 
@@ -237,28 +277,34 @@ class InputSequence(Sequence):
         return self.inputs, self.targets
 
 class InputSequenceGenerator:
-    def __init__(self, adj_indices, adj_values, features):
+    def __init__(self, adj_indices, adj_values, features, weights):
+        # weights: [f, c, w]
+        self.weights = weights
         self.adj_indices = adj_indices
         self.adj_values = adj_values
         self.features = features
         self.targets = None
         self.inputs = None
+        self.weight_matrix = None
 
     def seq(self, node_ids, targets=None):
         target_indices = np.asanyarray(node_ids)
         target_indices = np.reshape(target_indices, (1,) + target_indices.shape)
-        self.inputs = [self.features, target_indices, self.adj_indices, self.adj_values]
 
         if targets is not None:
             self.targets = targets
+        self.weight_matrix = np.zeros([1, 1602, 6])
+        for w in self.weights:
+            self.weight_matrix[0][w[0]][w[1]] = w[2] / len(self.weights)
+        self.inputs = [self.features, target_indices, self.adj_indices, self.adj_values, self.targets, self.weight_matrix]
         return InputSequence(self.inputs, self.targets)
-
-
 class IntegratedGradients:
   def __init__(self, model, seq):
     self._adj_value = seq.A_values
     self._adj_inds = seq.A_indices
     self._features = seq.features
+    self._weight_matrix = seq.weight_matrix
+    self._targets = seq.targets
     self._model = model
     self._num_node = seq.n_nodes
     self._node_idx = None
@@ -307,7 +353,7 @@ class IntegratedGradients:
       features_step = features_baseline + alpha * features_diff
       features_input = [features_step[:19], features_step[19:36], features_step[36:40], features_step[40:1554], features_step[1554:]]
       wrt = [tf.convert_to_tensor(f, dtype='float32') for f in features_input]
-      model_input = [[tf.convert_to_tensor(f) for f in self._features], tf.convert_to_tensor(np.array([[node_idx]])), tf.convert_to_tensor(self._adj_inds), tf.convert_to_tensor(self._adj_value)]
+      model_input = [[tf.convert_to_tensor(f) for f in self._features], tf.convert_to_tensor(np.array([[node_idx]])), tf.convert_to_tensor(self._adj_inds), tf.convert_to_tensor(self._adj_value), tf.convert_to_tensor(self._targets[:, 0:1, :]), tf.convert_to_tensor(self._weight_matrix)]
       grads = self._compute_self_gradients(model_input, class_of_interest, wrt=wrt)
       total_gradients += tf.concat(grads, -1)
     return np.array(total_gradients * features_diff / steps)
@@ -325,7 +371,7 @@ class IntegratedGradients:
       tape.watch(wrt)
       for i in range(len(self._features)):
         model_input[0][i] = tf.multiply(sup_1[i], K.expand_dims(tf.tile(input=K.expand_dims(wrt[i], 0), multiples=[self._num_node, 1]), 0)) + tf.multiply(model_input[0][i], sup_2[i])
-      output = self._model(model_input)
+      output = self._model(model_input)[1]
       cost_value = K.gather(output[0, 0], class_of_interest)
     gradients = tape.gradient(cost_value, wrt)
     return gradients
@@ -334,7 +380,7 @@ class IntegratedGradients:
     class_of_interest = tf.convert_to_tensor(class_of_interest)
     with tf.GradientTape() as tape:
       tape.watch(wrt)
-      output = self._model(model_input)
+      output = self._model(model_input)[1]
       cost_value = K.gather(output[0, 0], class_of_interest)
     gradients = tape.gradient(cost_value, wrt)
     return gradients

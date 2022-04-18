@@ -13,23 +13,8 @@
         "FLASK_APP": "app.py",
         "FLASK_ENV": "development"
       },
-      "args": ["run", "--no-debugger", "--host=127.0.0.1", "--port=5000"],
+      "args": ["run", "--no-debugger", "--host=192.168.61.91", "--port=7325"],
       "jinja": true
-    },
-    {
-      "name": "Docker: Python - Flask",
-      "type": "docker",
-      "request": "launch",
-      "preLaunchTask": "docker-run: debug",
-      "python": {
-        "pathMappings": [
-          {
-            "localRoot": "${workspaceFolder}",
-            "remoteRoot": "/app"
-          }
-        ],
-        "projectType": "flask"
-      }
     }
   ]
 }

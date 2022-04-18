@@ -1,5 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
+from tensorflow.keras import losses
 from tensorflow.keras import backend as K
 from tensorflow.keras import activations, initializers, constraints, regularizers
 
@@ -219,3 +220,41 @@ class AggregationLayer(Layer):
             return self.activation(Average()(outs))
           else:
             return self.activation(Concatenate()(outs))
+
+class Loss(Layer):
+    def __init__(self, e=0.1, **kwargs):
+        self.e = e
+        super(Loss, self).__init__(**kwargs)
+    
+    def get_config(self):
+        config = {}
+        base_config = super.get_config()
+        return {**base_config, **config}
+    
+    def compute_output_shape(self, input_shapes):
+        return [1]
+    
+    def build(self, input_shapes):
+        self.built = True
+        
+    def call(self, inputs):
+        y_pred_all = inputs[0]
+        y_true = inputs[1]
+        out_indices = inputs[2]
+        weight = inputs[3]
+        feature = inputs[4]
+        
+        weight_pos = tf.clip_by_value(weight, 0, 1)
+        weight_neg = tf.clip_by_value(weight, -1, 0)
+        
+        wp_neg = tf.multiply(tf.tile(tf.expand_dims(y_pred_all, 2), [1, 1, 1602, 1]), tf.tile(tf.expand_dims(weight_neg, 1), [1, 1514, 1, 1]))
+        wp_pos = tf.multiply(tf.tile(tf.expand_dims((tf.ones_like(y_pred_all) - y_pred_all), 2), [1, 1, 1602, 1]), tf.tile(tf.expand_dims(weight_pos, 1), [1, 1514, 1, 1]))
+        
+        y_pred = GatherIndices(batch_dims=1)([y_pred_all, out_indices])
+        
+        # feature = (tf.exp(1 - feature) - 1) / (np.e - 1)
+        
+        expand_feature = tf.tile(tf.expand_dims(feature, 3), [1, 1, 1, 6])
+        loss1 = losses.categorical_crossentropy(y_true, y_pred)
+        loss2 = tf.reduce_sum(tf.multiply(wp_pos, expand_feature)) - tf.reduce_sum(tf.multiply(wp_neg, expand_feature))
+        return [(1-self.e) * loss1 + self.e * loss2, y_pred]
